@@ -1,0 +1,80 @@
+name: Probe signer
+
+# d-probes-0, the probes factory-v0 needs. The organisation ruleset "probe-0: the
+# signer's workflow required on stoicheia-probe" requires this file, at the commit it
+# pins, on dodecaplex-co/stoicheia-probe's main, and on no other repository. It signs
+# the bytes of the candidate's payload.txt with a keyless Sigstore certificate.
+#
+# It signs on pull requests too, on purpose: those attestations are the planted
+# wrong-ref and wrong-event cases that verify must refuse. factory-v0's signer signs
+# on merge_group only.
+#
+# What the 27 October trial of ruleset workflows taught (stoicheia's queue-judge.yml):
+# - the rule runs the file only on the events its own `on:` names, so merge_group is
+#   named, and pull_request too, since the rule holds a pull request until it has run;
+# - a skipped required job counts as passed, so the job has no if of its own, and
+#   every step runs on both events;
+# - no concurrency group (GitHub's guide to ruleset workflows asks for none).
+#
+# It runs no code from the candidate: it reads payload.txt from Git's objects as data.
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Record the run context
+        env:
+          EVENT: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          printf 'probe-context %s=%s\n' \
+            event "$EVENT" repository "$REPOSITORY" ref "$REF" sha "$SHA" \
+            workflow_ref "$WORKFLOW_REF" workflow_sha "$WORKFLOW_SHA" \
+            group_head_sha "$GROUP_HEAD_SHA" group_head_ref "$GROUP_HEAD_REF" \
+            group_base_sha "$GROUP_BASE_SHA" runner_environment "$RUNNER_ENVIRONMENT"
+          case "$EVENT" in
+            pull_request|merge_group) ;;
+            *) echo "probe-refused: event $EVENT is not pull_request or merge_group"; exit 1 ;;
+          esac
+          if [ "$REPOSITORY" != "dodecaplex-co/stoicheia-probe" ]; then
+            echo "probe-refused: repository $REPOSITORY is not dodecaplex-co/stoicheia-probe"; exit 1
+          fi
+          if [ "$EVENT" = merge_group ] && [ "$SHA" != "$GROUP_HEAD_SHA" ]; then
+            echo "probe-refused: the run's commit is not the merge group's head"; exit 1
+          fi
+
+      - name: Take payload.txt from the candidate's Git objects
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          git init -q "$RUNNER_TEMP/candidate"
+          git -C "$RUNNER_TEMP/candidate" fetch -q --depth=1 --no-tags "https://github.com/$REPOSITORY" "$SHA"
+          test "$(git -C "$RUNNER_TEMP/candidate" rev-parse FETCH_HEAD)" = "$SHA"
+          mkdir "$RUNNER_TEMP/subject"
+          git -C "$RUNNER_TEMP/candidate" show "$SHA:payload.txt" > "$RUNNER_TEMP/subject/payload.txt"
+          sha256sum "$RUNNER_TEMP/subject/payload.txt"
+
+      - name: Sign payload.txt
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/subject/payload.txt
