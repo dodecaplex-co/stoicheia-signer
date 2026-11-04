@@ -1,0 +1,141 @@
+name: Probe signer
+
+# d-probes-0 v1, the probes factory-v0 needs. The organisation ruleset "probe-0: the
+# signer's workflow required on stoicheia-probe" requires this file, at the commit it
+# pins, on dodecaplex-co/stoicheia-probe's main, and on no other repository. It signs
+# the bytes of the candidate's payload.txt with a keyless Sigstore certificate.
+#
+# It signs on pull requests too, on purpose: those signatures are the planted
+# wrong-ref and wrong-event cases that verify must refuse. factory-v0's signer signs
+# on merge_group only.
+#
+# v1: it keeps the Sigstore bundle as this run's artifact and never writes GitHub's
+# attestation store. Run 1 (3 November) showed the store refusing a cross-repository
+# required workflow: "Failed to persist attestation: Invalid Argument - values do not
+# match: dodecaplex-co/stoicheia-signer/.github/workflows/probe-sign.yml !=
+# https://github.com/dodecaplex-co/stoicheia-signer/.github/workflows/probe-sign.yml".
+# actions/attest has no way to skip that write and still emit its bundle, so this
+# signs with cosign, fetched from Sigstore's release and checked by its SHA-256.
+# Where bundles live for the factory is c-carry's decision.
+#
+# What the 27 October trial of ruleset workflows taught (stoicheia's queue-judge.yml):
+# - the rule runs the file only on the events its own `on:` names, so merge_group is
+#   named, and pull_request too, since the rule holds a pull request until it has run;
+# - a skipped required job counts as passed, so the job has no if of its own, and
+#   every step runs on both events;
+# - no concurrency group (GitHub's guide to ruleset workflows asks for none).
+#
+# It runs no code from the candidate: it reads payload.txt from Git's objects as data.
+# It holds no credential beyond the run's OIDC token (id-token: write) and a read-only
+# GITHUB_TOKEN; the artifact upload uses the runner's own runtime token.
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Record the run context
+        env:
+          EVENT: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          printf 'probe-context %s=%s\n' \
+            event "$EVENT" repository "$REPOSITORY" ref "$REF" sha "$SHA" \
+            workflow_ref "$WORKFLOW_REF" workflow_sha "$WORKFLOW_SHA" \
+            group_head_sha "$GROUP_HEAD_SHA" group_head_ref "$GROUP_HEAD_REF" \
+            group_base_sha "$GROUP_BASE_SHA" runner_environment "$RUNNER_ENVIRONMENT"
+          case "$EVENT" in
+            pull_request|merge_group) ;;
+            *) echo "probe-refused: event $EVENT is not pull_request or merge_group"; exit 1 ;;
+          esac
+          if [ "$REPOSITORY" != "dodecaplex-co/stoicheia-probe" ]; then
+            echo "probe-refused: repository $REPOSITORY is not dodecaplex-co/stoicheia-probe"; exit 1
+          fi
+          if [ "$EVENT" = merge_group ] && [ "$SHA" != "$GROUP_HEAD_SHA" ]; then
+            echo "probe-refused: the run's commit is not the merge group's head"; exit 1
+          fi
+
+      - name: Take payload.txt from the candidate's Git objects
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          git init -q "$RUNNER_TEMP/candidate"
+          git -C "$RUNNER_TEMP/candidate" fetch -q --depth=1 --no-tags "https://github.com/$REPOSITORY" "$SHA"
+          test "$(git -C "$RUNNER_TEMP/candidate" rev-parse FETCH_HEAD)" = "$SHA"
+          mkdir "$RUNNER_TEMP/subject"
+          git -C "$RUNNER_TEMP/candidate" show "$SHA:payload.txt" > "$RUNNER_TEMP/subject/payload.txt"
+          sha256sum "$RUNNER_TEMP/subject/payload.txt"
+
+      - name: Fetch cosign v2.6.5, checked by its SHA-256
+        env:
+          # sigstore/cosign tag v2.6.5 is commit 3e82f50a2839855693aacf7b3d0e7e2f30774cb4; the
+          # digest is the one GitHub publishes for the release asset cosign-linux-amd64.
+          COSIGN_URL: https://github.com/sigstore/cosign/releases/download/v2.6.5/cosign-linux-amd64
+          COSIGN_SHA256: c3b4f5410e608af03a5eb0aaac84a4313d8da131248e08ff1759ac70c79d1644
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/cosign" "$COSIGN_URL"
+          printf '%s  %s\n' "$COSIGN_SHA256" "$RUNNER_TEMP/cosign" | sha256sum -c -
+          chmod 0755 "$RUNNER_TEMP/cosign"
+          "$RUNNER_TEMP/cosign" version
+
+      - name: Write the provenance predicate
+        env:
+          EVENT: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          # The workflow's own claims. Verify pins the certificate, which GitHub's OIDC
+          # token fills, never these.
+          jq -n --arg event "$EVENT" --arg repo "$REPOSITORY" --arg repo_id "$REPOSITORY_ID" \
+                --arg ref "$REF" --arg sha "$SHA" --arg wref "$WORKFLOW_REF" --arg wsha "$WORKFLOW_SHA" \
+                --arg run "$RUN_URL" '{
+            buildDefinition: {
+              buildType: "https://actions.github.io/buildtypes/workflow/v1",
+              externalParameters: {workflow: {ref: ($wref | split("@")[1]),
+                                              repository: ("https://github.com/" + ($wref | split("/")[0:2] | join("/"))),
+                                              path: ($wref | split("@")[0] | split("/")[2:] | join("/"))}},
+              internalParameters: {github: {event_name: $event, repository_id: $repo_id}},
+              resolvedDependencies: [{uri: ("git+https://github.com/" + $repo + "@" + $ref), digest: {gitCommit: $sha}},
+                                     {uri: ("git+https://github.com/" + $wref), digest: {gitCommit: $wsha}}]
+            },
+            runDetails: {builder: {id: ("https://github.com/" + $wref)}, metadata: {invocationId: $run}}
+          }' > "$RUNNER_TEMP/predicate.json"
+
+      - name: Sign payload.txt with Sigstore, keeping the bundle
+        run: |
+          mkdir "$RUNNER_TEMP/bundle"
+          "$RUNNER_TEMP/cosign" attest-blob --yes --new-bundle-format --rekor-entry-type dsse \
+            --type slsaprovenance1 --predicate "$RUNNER_TEMP/predicate.json" \
+            --bundle "$RUNNER_TEMP/bundle/bundle.json" "$RUNNER_TEMP/subject/payload.txt"
+          printf 'probe-bundle sha256=%s\n' "$(sha256sum "$RUNNER_TEMP/bundle/bundle.json" | cut -d' ' -f1)"
+
+      - name: Keep the bundle as this run's artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: probe-bundle
+          path: ${{ runner.temp }}/bundle/bundle.json
+          if-no-files-found: error
+          retention-days: 30
